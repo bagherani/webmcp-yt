@@ -1,262 +1,418 @@
-/**
- * Sample TypeScript app: MCP client + OpenAI.
- * Uses MCP servers from ~/.cursor/mcp.json and OpenAI-compatible API from env.
- */
-
 import "dotenv/config";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import OpenAI from "openai";
+import { chromium, type Browser, type Page } from "playwright-core";
 
-const MCP_CONFIG_PATH = join(process.env.HOME ?? "", ".cursor", "mcp.json");
+const APP_URL = process.env.WEBMCP_URL ?? "http://localhost:3000";
+const MODEL = process.env.OPENAI_MODEL ?? "gpt-4o-mini";
+const WEBMCP_CHROME_ARG = "--enable-experimental-web-platform-features";
 
-interface McpServerConfig {
-  command: string;
-  args?: string[];
-  env?: Record<string, string>;
+type JsonSchema = Record<string, unknown>;
+
+type PageToolDefinition = {
+  name: string;
+  description?: string;
+  inputSchema?: JsonSchema | string;
+  outputSchema?: JsonSchema | string;
+  annotations?: Record<string, unknown>;
+};
+
+type WebMcpTestingApi = {
+  listTools?: () => Promise<unknown> | unknown;
+  executeTool?: (
+    toolName: string,
+    toolArgs: string | unknown
+  ) => Promise<unknown> | unknown;
+};
+
+type WebMcpNavigator = Navigator & {
+  modelContextTesting?: WebMcpTestingApi;
+  modelContextTest?: WebMcpTestingApi;
+};
+
+type ChromeCandidate = {
+  executablePath: string;
+  version: string;
+  majorVersion: number;
+};
+
+const CHROME_EXECUTABLE_CANDIDATES = [
+  process.env.CHROME_EXECUTABLE_PATH,
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+  "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+  "/Applications/Chromium.app/Contents/MacOS/Chromium",
+].filter((value): value is string => Boolean(value));
+
+function getChromeCandidates(): ChromeCandidate[] {
+  return CHROME_EXECUTABLE_CANDIDATES.filter((candidate) =>
+    existsSync(candidate)
+  )
+    .map((executablePath) => {
+      const versionOutput = execFileSync(executablePath, ["--version"], {
+        encoding: "utf8",
+      }).trim();
+      const majorVersionMatch = versionOutput.match(/(\d+)\./);
+      const majorVersion = Number(majorVersionMatch?.[1] ?? 0);
+
+      return {
+        executablePath,
+        version: versionOutput,
+        majorVersion,
+      };
+    })
+    .sort((left, right) => right.majorVersion - left.majorVersion);
 }
 
-interface McpJson {
-  mcpServers?: Record<string, McpServerConfig>;
-}
+function getChromeExecutable(): ChromeCandidate {
+  const candidates = getChromeCandidates();
 
-function loadMcpConfig(): McpJson {
-  try {
-    const raw = readFileSync(MCP_CONFIG_PATH, "utf-8");
-    return JSON.parse(raw) as McpJson;
-  } catch (err) {
-    console.error("Failed to load MCP config from", MCP_CONFIG_PATH, err);
-    return {};
+  if (candidates.length === 0) {
+    throw new Error(
+      "Could not find a Chrome executable. Set CHROME_EXECUTABLE_PATH in .env if Chrome is installed somewhere else."
+    );
   }
+
+  const supportedCandidate = candidates.find(
+    (candidate) => candidate.majorVersion >= 146
+  );
+
+  if (!supportedCandidate) {
+    const installedVersions = candidates
+      .map((candidate) => candidate.version)
+      .join(", ");
+    throw new Error(
+      `WebMCP requires Chrome 146 or newer. Installed versions: ${installedVersions}`
+    );
+  }
+
+  return supportedCandidate;
 }
 
-async function connectServer(
-  name: string,
-  config: McpServerConfig
-): Promise<{ client: Client; transport: StdioClientTransport } | null> {
-  const transport = new StdioClientTransport({
-    command: config.command,
-    args: config.args ?? [],
-    env: config.env,
+async function waitForWebMcpTestingApi(page: Page) {
+  await page.waitForFunction(() => {
+    const nav = navigator as WebMcpNavigator;
+
+    return Boolean(
+      nav.modelContextTesting?.listTools ?? nav.modelContextTest?.listTools
+    );
   });
-  const client = new Client(
-    { name: "webmcp-sample", version: "0.1.0" },
-    { capabilities: {} }
-  );
-  try {
-    await client.connect(transport);
-    return { client, transport };
-  } catch (err) {
-    console.error(`Failed to connect to MCP server "${name}":`, err);
-    return null;
-  }
 }
 
-async function main() {
-  const config = loadMcpConfig();
-  const servers = config.mcpServers ?? {};
-  if (Object.keys(servers).length === 0) {
-    console.log("No mcpServers found in", MCP_CONFIG_PATH);
-    return;
-  }
-
-  const connections: Array<{
-    name: string;
-    client: Client;
-    transport: StdioClientTransport;
-  }> = [];
-
-  for (const [name, serverConfig] of Object.entries(servers)) {
-    // Use an isolated browser instance for chrome-devtools when run from this app,
-    // so we don't conflict with an already-running browser (e.g. from Cursor).
-    const config =
-      name === "chrome-devtools"
-        ? { ...serverConfig, args: [...(serverConfig.args ?? []), "--isolated"] }
-        : serverConfig;
-    const conn = await connectServer(name, config);
-    if (conn) {
-      connections.push({ name, ...conn });
-      console.log(`Connected to MCP server: ${name}`);
-    }
-  }
-
-  if (connections.length === 0) {
-    console.log("No MCP servers could be connected.");
-    return;
-  }
-
-  // List tools from each server
-  const allToolsByServer: Array<{ name: string; tools: Awaited<ReturnType<Client["listTools"]>>["tools"] }> = [];
-  for (const { name, client } of connections) {
-    const { tools } = await client.listTools();
-    allToolsByServer.push({ name, tools });
-    console.log(`\nTools from "${name}":`, tools.map((t) => t.name).join(", "));
-  }
-
-  // Demo: call "fetch" tool if available (from any server)
-  const fetchServerIndex = allToolsByServer.findIndex((s) =>
-    s.tools.some((t) => t.name === "fetch")
+async function launchBrowser(): Promise<{ browser: Browser; page: Page }> {
+  const chrome = getChromeExecutable();
+  console.log(
+    `Launching Chrome with WebMCP enabled: ${WEBMCP_CHROME_ARG}\nUsing: ${chrome.executablePath}\nVersion: ${chrome.version}`
   );
-  if (fetchServerIndex >= 0) {
-    const conn = connections[fetchServerIndex];
-    const result = await conn.client.callTool({
-      name: "fetch",
-      arguments: { url: "https://example.com", max_length: 500 },
-    });
-    const text =
-      "content" in result &&
-      Array.isArray(result.content) &&
-      result.content[0]?.type === "text"
-        ? result.content[0].text
-        : JSON.stringify(result);
-    console.log("\nFetch result (first 200 chars):", text.slice(0, 200) + "...");
+
+  const browser = await chromium.launch({
+    executablePath: chrome.executablePath,
+    headless: false,
+    args: [WEBMCP_CHROME_ARG],
+  });
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
+  await page.waitForLoadState("networkidle");
+  await waitForWebMcpTestingApi(page);
+
+  return { browser, page };
+}
+
+async function listPageTools(page: Page): Promise<PageToolDefinition[]> {
+  const tools = await page.evaluate(async () => {
+    const nav = navigator as WebMcpNavigator;
+    const testingApi = nav.modelContextTesting ?? nav.modelContextTest;
+
+    if (!testingApi?.listTools) {
+      throw new Error("navigator.modelContextTesting.listTools is not available.");
+    }
+
+    return await testingApi.listTools();
+  });
+
+  if (!Array.isArray(tools)) {
+    return [];
   }
 
-  // OpenAI client (custom base URL + API key from env)
+  return (tools as PageToolDefinition[]).map((tool) => ({
+    ...tool,
+    inputSchema: normalizeSchema(tool.inputSchema, tool.name),
+    outputSchema: normalizeSchema(tool.outputSchema, tool.name),
+  }));
+}
+
+async function executePageTool(
+  page: Page,
+  name: string,
+  args: unknown
+): Promise<unknown> {
+  const result = await page.evaluate(
+    async ({ name, args }) => {
+      const nav = navigator as WebMcpNavigator;
+      const testingApi = nav.modelContextTesting ?? nav.modelContextTest;
+
+      if (!testingApi?.executeTool) {
+        throw new Error(
+          "navigator.modelContextTesting.executeTool is not available."
+        );
+      }
+
+      const serializedArgs =
+        typeof args === "string" ? args : JSON.stringify(args ?? {});
+      const rawResult = await testingApi.executeTool(name, serializedArgs);
+
+      if (typeof rawResult !== "string") {
+        return rawResult;
+      }
+
+      try {
+        return JSON.parse(rawResult);
+      } catch {
+        return rawResult;
+      }
+    },
+    { name, args }
+  );
+
+  await page.waitForTimeout(200);
+  return result;
+}
+
+function toToolResultText(result: unknown): string {
+  if (typeof result === "string") {
+    return result;
+  }
+
+  if (result === undefined) {
+    return "null";
+  }
+
+  return JSON.stringify(result);
+}
+
+function normalizeSchema(
+  schema: JsonSchema | string | undefined,
+  toolName: string
+): JsonSchema {
+  if (!schema) {
+    return { type: "object", properties: {} };
+  }
+
+  if (typeof schema === "string") {
+    try {
+      const parsed = JSON.parse(schema) as unknown;
+
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as JsonSchema;
+      }
+    } catch (error) {
+      const errorText = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `Could not parse input schema for tool "${toolName}": ${errorText}`
+      );
+    }
+
+    console.warn(
+      `Tool "${toolName}" exposed a string input schema. Falling back to an empty object schema.`
+    );
+    return { type: "object", properties: {} };
+  }
+
+  return schema;
+}
+
+function normalizeToolArguments(
+  tool: PageToolDefinition | undefined,
+  rawArgs: unknown
+): unknown {
+  const schema = normalizeSchema(tool?.inputSchema, tool?.name ?? "unknown");
+  const properties =
+    schema.properties && typeof schema.properties === "object"
+      ? (schema.properties as Record<string, unknown>)
+      : {};
+  const propertyNames = Object.keys(properties);
+
+  if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+    return JSON.parse(JSON.stringify(rawArgs));
+  }
+
+  if (typeof rawArgs === "string" && propertyNames.length === 1) {
+    return { [propertyNames[0]]: rawArgs };
+  }
+
+  return rawArgs;
+}
+
+function toOpenAiTools(
+  pageTools: PageToolDefinition[]
+): OpenAI.Chat.Completions.ChatCompletionTool[] {
+  return pageTools
+    .filter((tool) => /^[A-Za-z0-9_-]{1,64}$/.test(tool.name))
+    .map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description:
+          tool.description ??
+          `Call the ${tool.name} tool exposed by the current webpage.`,
+        parameters: normalizeSchema(tool.inputSchema, tool.name),
+      },
+    }));
+}
+
+async function runAgent(page: Page, pageTools: PageToolDefinition[]) {
   const apiKey = process.env.OPENAI_API_KEY;
   const baseURL = process.env.OPENAI_BASE_URL;
 
   if (!apiKey) {
     console.log(
-      "\nSet OPENAI_API_KEY (and optionally OPENAI_BASE_URL) in .env to use the LLM."
+      "\nOPENAI_API_KEY is not set, so I only opened the page and listed its WebMCP tools."
     );
-  } else {
-    const openai = new OpenAI({
-      apiKey,
-      baseURL: baseURL ?? undefined,
+    return;
+  }
+
+  const openai = new OpenAI({
+    apiKey,
+    baseURL: baseURL ?? undefined,
+  });
+
+  const tools = toOpenAiTools(pageTools);
+  const toolByName = new Map(pageTools.map((tool) => [tool.name, tool]));
+  type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
+
+  const messages: Message[] = [
+    {
+      role: "system",
+      content:
+        "You are helping with a local store app that is already open in Chrome. Use the page tools when they are useful. If you search for products, pick the best exact match for the user's request before adding it to the cart. Keep your final reply short, natural, and human.",
+    },
+    {
+      role: "user",
+      content:
+        "The local store is already open. Please find the Trail Daypack and add it to the cart. Use the available page tools if that helps, then briefly tell me what you did.",
+    },
+  ];
+
+  let completion = await openai.chat.completions.create({
+    model: MODEL,
+    messages,
+    tools: tools.length ? tools : undefined,
+    max_tokens: 1024,
+  });
+
+  const maxToolRounds = 10;
+  let rounds = 0;
+
+  while (rounds < maxToolRounds) {
+    const message = completion.choices[0]?.message;
+
+    if (!message) {
+      break;
+    }
+
+    messages.push({
+      role: "assistant",
+      content: message.content ?? null,
+      tool_calls:
+        message.tool_calls as OpenAI.Chat.Completions.ChatCompletionMessage["tool_calls"],
     });
 
-    // Build OpenAI-format tools from MCP tools and a map: toolName -> client.
-    // Exclude browser_eval (next-devtools) so the LLM uses chrome-devtools (navigate_page, fill, click)
-    // instead of Playwright. Chrome DevTools MCP connects to your Chrome directly; no Playwright.
-    const EXCLUDED_TOOLS = new Set(["browser_eval"]);
-    type ToolEntry = (typeof allToolsByServer)[0]["tools"][0];
-    const openaiTools: OpenAI.Chat.Completions.ChatCompletionTool[] = [];
-    const toolNameToClient = new Map<string, { client: Client; serverName: string }>();
-    for (const { name: serverName, tools } of allToolsByServer) {
-      for (const t of tools as ToolEntry[]) {
-        if (EXCLUDED_TOOLS.has(t.name)) continue;
-        openaiTools.push({
-          type: "function",
-          function: {
-            name: t.name,
-            description: t.description ?? undefined,
-            parameters: t.inputSchema ?? { type: "object" },
-          },
-        });
-        if (!toolNameToClient.has(t.name)) {
-          const conn = connections.find((c) => c.name === serverName)!;
-          toolNameToClient.set(t.name, { client: conn.client, serverName });
-        }
+    if (!message.tool_calls?.length) {
+      if (message.content) {
+        console.log(`\nAgent: ${message.content}`);
       }
+      return;
     }
 
-    type Message = OpenAI.Chat.Completions.ChatCompletionMessageParam;
-    const messages: Message[] = [
-      {
-        role: "system",
-        content:
-          "You are a helpful assistant. For opening web pages and interacting with sites, use the chrome-devtools tools: navigate_page (open a URL), list_pages, fill (type in inputs), click, etc. Use these tools—do not describe actions without calling them.",
-      },
-      {
-        role: "user",
-        content: `open bol.com, accept cookier banner,
-          and search for 'iphone 17 pro max 256gb'
-          and get its prices and return the cheapest one.`,
-      },
-    ];
+    for (const toolCall of message.tool_calls) {
+      const toolName = toolCall.function.name;
+      const rawArgs = (() => {
+        try {
+          return JSON.parse(toolCall.function.arguments ?? "{}") as unknown;
+        } catch {
+          return toolCall.function.arguments ?? {};
+        }
+      })();
+      const parsedArgs = normalizeToolArguments(
+        toolByName.get(toolName),
+        rawArgs
+      );
 
-    try {
-      let completion = await openai.chat.completions.create({
-        model: "gpt-4o-mini",
-        messages,
-        tools: openaiTools.length ? openaiTools : undefined,
-        max_tokens: 1024,
-      });
+      try {
+        const result = await executePageTool(page, toolName, parsedArgs);
+        const resultText = toToolResultText(result);
 
-      const maxToolRounds = 15;
-      let rounds = 0;
+        console.log(
+          `\nTool ${toolName} -> ${resultText.slice(0, 300)}${
+            resultText.length > 300 ? "..." : ""
+          }`
+        );
 
-      while (rounds < maxToolRounds) {
-        const choice = completion.choices[0];
-        if (!choice?.message) break;
-
-        const msg = choice.message;
         messages.push({
-          role: "assistant",
-          content: msg.content ?? null,
-          tool_calls: msg.tool_calls as OpenAI.Chat.Completions.ChatCompletionMessage["tool_calls"],
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: resultText,
         });
+      } catch (error) {
+        const errorText =
+          error instanceof Error ? error.message : String(error);
 
-        const toolCalls = msg.tool_calls;
-        if (!toolCalls?.length) {
-          if (msg.content) console.log("\nLLM reply:", msg.content);
-          break;
-        }
-
-        for (const tc of toolCalls) {
-          const name = tc.function?.name;
-          const args = (() => {
-            try {
-              return (tc.function?.arguments && JSON.parse(tc.function.arguments)) ?? {};
-            } catch {
-              return {};
-            }
-          })();
-          const entry = name ? toolNameToClient.get(name) : undefined;
-          if (!entry) {
-            console.warn("\nUnknown tool:", name);
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify({ error: `Unknown tool: ${name}` }),
-            });
-            continue;
-          }
-          try {
-            const result = await entry.client.callTool({ name: name!, arguments: args });
-            const text =
-              "content" in result &&
-              Array.isArray(result.content) &&
-              result.content[0]?.type === "text"
-                ? result.content[0].text
-                : JSON.stringify(result);
-            console.log("\nTool", name, "->", text.slice(0, 200) + (text.length > 200 ? "..." : ""));
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: text,
-            });
-          } catch (err) {
-            const errText = err instanceof Error ? err.message : String(err);
-            console.warn("\nTool", name, "error:", errText);
-            messages.push({
-              role: "tool",
-              tool_call_id: tc.id,
-              content: JSON.stringify({ error: errText }),
-            });
-          }
-        }
-
-        rounds++;
-        completion = await openai.chat.completions.create({
-          model: "gpt-4o-mini",
-          messages,
-          tools: openaiTools.length ? openaiTools : undefined,
-          max_tokens: 1024,
+        console.warn(`\nTool ${toolName} error: ${errorText}`);
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: JSON.stringify({ error: errorText }),
         });
       }
-    } catch (err) {
-      console.error("OpenAI request failed:", err);
     }
+
+    rounds += 1;
+    completion = await openai.chat.completions.create({
+      model: MODEL,
+      messages,
+      tools: tools.length ? tools : undefined,
+      max_tokens: 1024,
+    });
   }
 
-  // Cleanup
-  for (const { client } of connections) {
-    await client.close();
-  }
+  console.warn("\nStopped after reaching the maximum number of tool rounds.");
 }
 
-main().catch(console.error);
+async function waitForBrowserClose(browser: Browser) {
+  if (!browser.isConnected()) {
+    return;
+  }
+
+  console.log("\nBrowser will stay open. Close the Chrome window to stop this app.");
+  await new Promise<void>((resolve) => {
+    browser.once("disconnected", () => resolve());
+  });
+}
+
+async function main() {
+  const { browser, page } = await launchBrowser();
+
+  const pageTools = await listPageTools(page);
+  console.log(
+    "\nPage WebMCP tools:",
+    pageTools.length
+      ? pageTools.map((tool) => tool.name).join(", ")
+      : "(none found)"
+  );
+
+  try {
+    await runAgent(page, pageTools);
+  } catch (error) {
+    console.error("\nAgent run failed:", error);
+  }
+
+  await waitForBrowserClose(browser);
+  console.log("Chrome was closed. Exiting.");
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -1,44 +1,22 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import {
-  registerSearchTools,
-  searchNames,
-  unregisterSearchTools,
-} from "../webmcp";
+import { CartSidebar } from "./store/CartSidebar";
+import { ProductGrid } from "./store/ProductGrid";
+import { SearchBar } from "./store/SearchBar";
+import { StoreProvider } from "./store/store-context";
 
 export default function Search() {
-  const [search, setSearch] = useState<string>("");
-  const filteredNames = searchNames(search);
-
-  useEffect(() => {
-    const handleSearchNames = (event: CustomEvent<{ query: string }>) => {
-      setSearch(event.detail.query);
-    };
-
-    window.addEventListener("searchNames", handleSearchNames as EventListener);
-    registerSearchTools();
-
-    return () => {
-      window.removeEventListener("searchNames", handleSearchNames as EventListener);
-      unregisterSearchTools();
-    };
-  }, []);
-
   return (
-    <div className="flex flex-col gap-4">
-      <input
-        className="border border-gray-300 rounded-md p-2 text-3xl"
-        type="text"
-        placeholder="Search"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-      />
-      <ul className="list-disc list-inside text-3xl">
-        {filteredNames.map((name) => (
-          <li key={name}>{name}</li>
-        ))}
-      </ul>
-    </div>
+    <StoreProvider>
+      <div className="min-h-screen w-full bg-slate-50 text-slate-950">
+        <div className="grid min-h-screen gap-6 p-6 md:grid-cols-[minmax(0,1fr)_18rem] xl:grid-cols-[minmax(0,1fr)_22rem]">
+          <section className="min-w-0 w-full space-y-6">
+            <SearchBar />
+            <ProductGrid />
+          </section>
+          <CartSidebar />
+        </div>
+      </div>
+    </StoreProvider>
   );
 }
