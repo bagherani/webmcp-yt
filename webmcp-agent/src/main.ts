@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import OpenAI from "openai";
+import OpenAI from "openai/index.mjs";
 import { chromium, type Browser, type Page } from "playwright-core";
 
 const APP_URL = process.env.WEBMCP_URL ?? "http://localhost:3000";
@@ -345,8 +345,7 @@ async function runAgent(page: Page, pageTools: PageToolDefinition[]) {
         const resultText = toToolResultText(result);
 
         console.log(
-          `\nTool ${toolName} -> ${resultText.slice(0, 300)}${
-            resultText.length > 300 ? "..." : ""
+          `\nTool ${toolName} -> ${resultText.slice(0, 300)}${resultText.length > 300 ? "..." : ""
           }`
         );
 
