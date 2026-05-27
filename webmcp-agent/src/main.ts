@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import OpenAI from "openai/index.mjs";
+import OpenAI from "openai";
 import { chromium, type Browser, type Page } from "playwright-core";
 
 const APP_URL = process.env.WEBMCP_URL ?? "http://localhost:3000";
@@ -18,17 +18,20 @@ type PageToolDefinition = {
   annotations?: Record<string, unknown>;
 };
 
-type WebMcpTestingApi = {
-  listTools?: () => Promise<unknown> | unknown;
+type PageToolHandle = PageToolDefinition & {
+  window?: Window;
+};
+
+type WebMcpModelContext = {
+  getTools?: () => Promise<PageToolHandle[]> | PageToolHandle[];
   executeTool?: (
-    toolName: string,
+    tool: PageToolHandle,
     toolArgs: string | unknown
   ) => Promise<unknown> | unknown;
 };
 
-type WebMcpNavigator = Navigator & {
-  modelContextTesting?: WebMcpTestingApi;
-  modelContextTest?: WebMcpTestingApi;
+type WebMcpDocument = Document & {
+  modelContext?: WebMcpModelContext;
 };
 
 type ChromeCandidate = {
@@ -89,12 +92,12 @@ function getChromeExecutable(): ChromeCandidate {
   return supportedCandidate;
 }
 
-async function waitForWebMcpTestingApi(page: Page) {
+async function waitForWebMcpApi(page: Page) {
   await page.waitForFunction(() => {
-    const nav = navigator as WebMcpNavigator;
+    const modelContext = (document as WebMcpDocument).modelContext;
 
     return Boolean(
-      nav.modelContextTesting?.listTools ?? nav.modelContextTest?.listTools
+      modelContext?.getTools && modelContext.executeTool
     );
   });
 }
@@ -115,21 +118,26 @@ async function launchBrowser(): Promise<{ browser: Browser; page: Page }> {
 
   await page.goto(APP_URL, { waitUntil: "domcontentloaded" });
   await page.waitForLoadState("networkidle");
-  await waitForWebMcpTestingApi(page);
+  await waitForWebMcpApi(page);
 
   return { browser, page };
 }
 
 async function listPageTools(page: Page): Promise<PageToolDefinition[]> {
   const tools = await page.evaluate(async () => {
-    const nav = navigator as WebMcpNavigator;
-    const testingApi = nav.modelContextTesting ?? nav.modelContextTest;
+    const modelContext = (document as WebMcpDocument).modelContext;
 
-    if (!testingApi?.listTools) {
-      throw new Error("navigator.modelContextTesting.listTools is not available.");
+    if (!modelContext?.getTools) {
+      throw new Error("document.modelContext.getTools is not available.");
     }
 
-    return await testingApi.listTools();
+    return (await modelContext.getTools()).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.inputSchema,
+      outputSchema: tool.outputSchema,
+      annotations: tool.annotations,
+    }));
   });
 
   if (!Array.isArray(tools)) {
@@ -150,18 +158,26 @@ async function executePageTool(
 ): Promise<unknown> {
   const result = await page.evaluate(
     async ({ name, args }) => {
-      const nav = navigator as WebMcpNavigator;
-      const testingApi = nav.modelContextTesting ?? nav.modelContextTest;
+      const modelContext = (document as WebMcpDocument).modelContext;
 
-      if (!testingApi?.executeTool) {
+      if (!modelContext?.getTools || !modelContext.executeTool) {
         throw new Error(
-          "navigator.modelContextTesting.executeTool is not available."
+          "document.modelContext.executeTool is not available."
         );
       }
 
       const serializedArgs =
         typeof args === "string" ? args : JSON.stringify(args ?? {});
-      const rawResult = await testingApi.executeTool(name, serializedArgs);
+      const tools = await modelContext.getTools();
+      const tool =
+        tools.find((candidate) => candidate.name === name && candidate.window === window) ??
+        tools.find((candidate) => candidate.name === name);
+
+      if (!tool) {
+        throw new Error(`document.modelContext tool "${name}" was not found.`);
+      }
+
+      const rawResult = await modelContext.executeTool(tool, serializedArgs);
 
       if (typeof rawResult !== "string") {
         return rawResult;
