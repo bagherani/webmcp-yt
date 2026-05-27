@@ -6,7 +6,7 @@ A monorepo for **MCP (Model Context Protocol)** experiments: a Next.js web app t
 
 | Package    | Description |
 |-----------|-------------|
-| **[webmcp/](./webmcp)** | Next.js app with a sample MCP tool (e.g. name search). Use it in a Cursor-like environment that supports `navigator.modelContext` to register and call tools from the page. |
+| **[webmcp/](./webmcp)** | Next.js app with a sample MCP tool (e.g. name search). Use it in a Cursor-like environment that supports `document.modelContext` to register and call tools from the page. |
 | **[mcp/](./mcp)**       | CLI that reads MCP servers from `~/.cursor/mcp.json`, connects to them via stdio, and runs an OpenAI-compatible LLM with those tools (e.g. browser automation via the chrome-devtools MCP server). |
 
 ## Quick start

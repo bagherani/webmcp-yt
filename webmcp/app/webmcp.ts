@@ -14,9 +14,17 @@ type RegisteredTool = Pick<
   "name" | "description" | "inputSchema" | "outputSchema" | "annotations"
 >;
 
-type NativeRegisteredTool = Omit<RegisteredTool, "inputSchema" | "outputSchema"> & {
-  inputSchema?: Record<string, unknown> | string;
-  outputSchema?: Record<string, unknown> | string;
+type ModelContext = {
+  registerTool: (
+    tool: Tool<unknown, unknown>,
+    options?: { signal?: AbortSignal }
+  ) => void;
+  unregisterTool?: (name: string) => void;
+  getTools?: () => Promise<RegisteredTool[]> | RegisteredTool[];
+  executeTool?: (
+    tool: RegisteredTool,
+    args: unknown
+  ) => Promise<unknown> | unknown;
 };
 
 type SearchProductsArgs = {
@@ -53,28 +61,14 @@ type AddToCartResult = {
 };
 
 declare global {
-  interface Navigator {
-    modelContext?: {
-      registerTool: (
-        tool: Tool<unknown, unknown>,
-        options?: { signal?: AbortSignal }
-      ) => void;
-      unregisterTool?: (name: string) => void;
-    };
-    modelContextTesting?: {
-      listTools?: () => Promise<RegisteredTool[]> | RegisteredTool[];
-      executeTool?: (
-        name: string,
-        args: unknown
-      ) => Promise<unknown> | unknown;
-    };
+  interface Document {
+    modelContext?: ModelContext;
   }
 }
 
 const PRODUCT_SEARCH_EVENT = "webmcp:search-products";
 const ADD_TO_CART_EVENT = "webmcp:add-to-cart";
 
-const registeredTools = new Map<string, Tool<unknown, unknown>>();
 const toolControllers = new Map<string, AbortController>();
 
 function normalizeQuery(query: string): string {
@@ -113,29 +107,6 @@ function dispatchWindowEvent<T>(eventName: string, detail: T) {
   }
 
   window.dispatchEvent(new CustomEvent<T>(eventName, { detail }));
-}
-
-function normalizeTestingSchema(
-  schema: Record<string, unknown> | string | undefined
-): Record<string, unknown> | undefined {
-  if (!schema) {
-    return undefined;
-  }
-
-  if (typeof schema !== "string") {
-    return schema;
-  }
-
-  try {
-    const parsed = JSON.parse(schema) as unknown;
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // Ignore malformed native schema strings and leave them undefined.
-  }
-
-  return undefined;
 }
 
 function searchProductsToolExecute(
@@ -265,88 +236,23 @@ const storeTools: Array<Tool<unknown, unknown>> = [
   addToCartTool as Tool<unknown, unknown>,
 ];
 
-function getModelContextTesting() {
+function getModelContext() {
   if (typeof window === "undefined") {
     return undefined;
   }
 
-  return window.navigator.modelContextTesting;
+  return document.modelContext;
 }
 
-export const modelContextTest = {
-  async listTools(): Promise<RegisteredTool[]> {
-    const modelContextTesting = getModelContextTesting();
-
-    if (modelContextTesting?.listTools) {
-      const nativeTools =
-        (await modelContextTesting.listTools()) as NativeRegisteredTool[];
-
-      return nativeTools.map(
-        ({ name, description, inputSchema, outputSchema, annotations }) => ({
-          name,
-          description,
-          inputSchema: normalizeTestingSchema(inputSchema) ?? {},
-          outputSchema: normalizeTestingSchema(outputSchema),
-          annotations,
-        })
-      );
-    }
-
-    return Array.from(registeredTools.values()).map(
-      ({ name, description, inputSchema, outputSchema, annotations }) => ({
-        name,
-        description,
-        inputSchema,
-        outputSchema,
-        annotations,
-      })
-    );
-  },
-
-  async executeTool(name: string, args: unknown): Promise<unknown> {
-    const modelContextTesting = getModelContextTesting();
-
-    if (modelContextTesting?.executeTool) {
-      const rawResult = await modelContextTesting.executeTool(
-        name,
-        JSON.stringify(args ?? {})
-      );
-
-      if (typeof rawResult !== "string") {
-        return rawResult;
-      }
-
-      try {
-        return JSON.parse(rawResult);
-      } catch {
-        return rawResult;
-      }
-    }
-
-    const tool = registeredTools.get(name);
-
-    if (!tool) {
-      throw new Error(`Tool "${name}" is not registered.`);
-    }
-
-    return await tool.execute(args);
-  },
-};
-
 export function registerStoreTools() {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  const modelContext = window.navigator.modelContext;
+  const modelContext = getModelContext();
 
   if (!modelContext) {
     return;
   }
 
   for (const tool of storeTools) {
-    registeredTools.set(tool.name, tool);
-
+    toolControllers.get(tool.name)?.abort();
     const controller = new AbortController();
     toolControllers.set(tool.name, controller);
 
@@ -359,11 +265,7 @@ export function registerStoreTools() {
 }
 
 export function unregisterStoreTools() {
-  if (typeof window === "undefined") {
-    return;
-  }
-
-  const modelContext = window.navigator.modelContext;
+  const modelContext = getModelContext();
 
   for (const tool of storeTools) {
     toolControllers.get(tool.name)?.abort();
@@ -373,7 +275,6 @@ export function unregisterStoreTools() {
       modelContext.unregisterTool(tool.name);
     }
 
-    registeredTools.delete(tool.name);
   }
 }
 
