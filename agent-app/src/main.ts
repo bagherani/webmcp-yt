@@ -3,32 +3,17 @@ import "dotenv/config";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import chalk from "chalk";
-import { z } from "zod";
 
-const PRODUCT_URL =
-  "https://www.bol.com/nl/nl/p/sony-playstation-5-pro/9300000189666732";
-const COOKIE_ACCEPT_TEXTS = [
-  "accepteren",
-  "alles accepteren",
-  "accepteer",
-  "accepteer alle",
-  "accept",
-  "accept all",
-  "allow all",
-  "akkoord",
-  "agree",
-  "i agree",
-  "oke",
-  "ok",
-];
-const COOKIE_BANNER_ACCEPT_DELAY_MS = 5000;
+import { runBrowserAgent, type McpTool } from "./ai-agent.js";
+import { extractBagInfoWithPolling, type BagInfo } from "./ai-extract.js";
+import {
+  dismissCookieBanner,
+  wrapCallToolWithCookieDismiss,
+} from "./cookie-banner.js";
 
-const ProductInfoSchema = z.object({
-  title: z.string(),
-  price: z.string(),
-});
-
-type ProductInfo = z.infer<typeof ProductInfoSchema>;
+const SEARCH_URL = "https://www.miele.nl/search";
+const OWNED_VACUUM = "Guard M1 Flex Nordic Blue";
+const SEARCH_QUERY = OWNED_VACUUM;
 
 type JsonSchema = {
   type?: string;
@@ -37,37 +22,23 @@ type JsonSchema = {
   [key: string]: unknown;
 };
 
-type McpTool = {
-  name: string;
-  description?: string;
-  inputSchema?: JsonSchema;
-};
-
 function logStep(message: string): void {
   console.log(`${chalk.cyanBright("->")} ${chalk.cyan(message)}`);
 }
 
-function normalizeText(value: string): string {
-  return value
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function printProductInfo(product: ProductInfo): void {
+function printBagInfo(bag: BagInfo): void {
   const line = chalk.blueBright("=".repeat(56));
 
   console.log("");
   console.log(line);
-  console.log(chalk.bold.whiteBright(" Product Summary "));
+  console.log(chalk.bold.whiteBright(` Compatible bag for ${OWNED_VACUUM} `));
   console.log(line);
-  console.log(`${chalk.bold.cyan("Title:")} ${chalk.white(product.title)}`);
-  console.log(`${chalk.bold.cyan("Price:")} ${chalk.greenBright.bold(product.price)}`);
+  console.log(`${chalk.bold.cyan("Title:")} ${chalk.white(bag.title)}`);
+  console.log(`${chalk.bold.cyan("Price:")} ${chalk.greenBright.bold(bag.price)}`);
+  console.log(`${chalk.bold.cyan("Link:")} ${chalk.gray(bag.url)}`);
   console.log("");
   console.log(chalk.dim("Raw JSON"));
-  console.log(chalk.gray(JSON.stringify(product, null, 2)));
+  console.log(chalk.gray(JSON.stringify(bag, null, 2)));
   console.log("");
 }
 
@@ -158,120 +129,14 @@ async function callTool(
   return toolResultToText(result);
 }
 
-async function openProductPage(client: Client): Promise<void> {
-  await callTool(client, "new_page", { url: PRODUCT_URL });
-}
-
-function findSnapshotButton(snapshotText: string): { uid: string; label: string } | null {
-  const buttonPattern = /uid=([^\s]+)\s+button\s+"([^"]+)"/g;
-  let match: RegExpExecArray | null;
-
-  while ((match = buttonPattern.exec(snapshotText)) !== null) {
-    const [, uid, label] = match;
-    const normalizedLabel = normalizeText(label);
-
-    if (
-      COOKIE_ACCEPT_TEXTS.some(
-        (candidate) =>
-          normalizedLabel === normalizeText(candidate) ||
-          normalizedLabel.includes(normalizeText(candidate))
-      )
-    ) {
-      return { uid, label };
-    }
-  }
-
-  return null;
-}
-
-async function dismissCookieBanner(client: Client): Promise<boolean> {
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const snapshotText = await callTool(client, "take_snapshot", {});
-    const matchingButton = findSnapshotButton(snapshotText);
-
-    if (matchingButton) {
-      await callTool(client, "click", { uid: matchingButton.uid });
-      logStep(`Accepted the cookie banner via "${matchingButton.label}".`);
-      return true;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 750));
-  }
-
-  logStep("No cookie banner acceptance button was found in the page snapshot.");
-  return false;
-}
-
-function extractTitleFromSnapshot(snapshotText: string): string | null {
-  const headingMatch = snapshotText.match(/heading "([^"]+)" level="1"/);
-
-  if (headingMatch) {
-    return headingMatch[1];
-  }
-
-  const rootTitleMatch = snapshotText.match(/RootWebArea "([^"]+?) \| bol"/);
-  return rootTitleMatch?.[1] ?? null;
-}
-
-function formatDutchPrice(text: string): string {
-  const priceMatch = text.match(/(\d+)\s+euro(?:\s+en\s+(\d+)\s+cent)?/i);
-
-  if (!priceMatch) {
-    return text.trim();
-  }
-
-  const euros = Number(priceMatch[1]);
-  const cents = Number(priceMatch[2] ?? 0);
-  const amount = euros + cents / 100;
-
-  return new Intl.NumberFormat("nl-NL", {
-    style: "currency",
-    currency: "EUR",
-  }).format(amount);
-}
-
-function extractPriceFromSnapshot(snapshotText: string): string | null {
-  const buyBlockMatch = snapshotText.match(
-    /heading "Prijsinformatie en bestellen" level="2"([\s\S]*?)(?:\n\s+uid=.*heading "|$)/
-  );
-  const priceSentenceMatch =
-    buyBlockMatch?.[1].match(/StaticText "De prijs van dit product is ([^"]+)"/) ??
-    snapshotText.match(/StaticText "De prijs van dit product is ([^"]+)"/);
-
-  if (!priceSentenceMatch) {
-    return null;
-  }
-
-  return formatDutchPrice(priceSentenceMatch[1]);
-}
-
-function extractProductInfoFromSnapshot(snapshotText: string): ProductInfo | null {
-  const title = extractTitleFromSnapshot(snapshotText);
-  const price = extractPriceFromSnapshot(snapshotText);
-
-  if (!title || !price) {
-    return null;
-  }
-
-  return ProductInfoSchema.parse({ title, price });
-}
-
-async function extractProductInfo(client: Client): Promise<ProductInfo> {
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    const snapshotText = await callTool(client, "take_snapshot", {});
-    const productInfo = extractProductInfoFromSnapshot(snapshotText);
-
-    if (productInfo) {
-      return productInfo;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, 750));
-  }
-
-  throw new Error("Could not extract the product title and price from the page content.");
+function isOpenAiAuthError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /api key|authentication|unauthorized|401|invalid.*key/i.test(message);
 }
 
 async function main() {
+  logStep(`Mission: find a dust bag for your ${OWNED_VACUUM}.`);
+
   const transport = new StdioClientTransport({
     command: "npx",
     args: [
@@ -293,35 +158,36 @@ async function main() {
     await client.connect(transport);
 
     const { tools } = await client.listTools();
-    const mcpTools = tools.map((tool) => ({
+    const mcpTools: McpTool[] = tools.map((tool) => ({
       name: tool.name,
       description: tool.description,
       inputSchema: normalizeSchema(tool.inputSchema),
     }));
 
-    if (!mcpTools.some((tool) => tool.name === "new_page")) {
-      throw new Error('The DevTools MCP server did not expose the "new_page" tool.');
-    }
-
     logStep(`Loaded ${mcpTools.length} MCP tool(s).`);
-    logStep("Opening the product page...");
-    await openProductPage(client);
-    if (
-      mcpTools.some((tool) => tool.name === "take_snapshot") &&
-      mcpTools.some((tool) => tool.name === "click")
-    ) {
-      logStep(
-        `Waiting ${COOKIE_BANNER_ACCEPT_DELAY_MS / 1000} seconds before accepting the cookie banner...`
-      );
-      await new Promise((resolve) =>
-        setTimeout(resolve, COOKIE_BANNER_ACCEPT_DELAY_MS)
-      );
-      logStep("Checking for a cookie banner...");
-      await dismissCookieBanner(client);
-    }
-    logStep("Extracting product details...");
-    const productInfo = await extractProductInfo(client);
-    printProductInfo(productInfo);
+
+    const callToolWithCookies = wrapCallToolWithCookieDismiss((name, args) =>
+      callTool(client, name, args)
+    );
+
+    logStep("Opening the search page and dismissing the cookie banner...");
+    await callTool(client, "new_page", { url: SEARCH_URL });
+    await dismissCookieBanner((name, args) => callTool(client, name, args));
+
+    logStep("Running the AI browser agent (search vacuum → open bag)...");
+    await runBrowserAgent(callToolWithCookies, mcpTools, {
+      searchUrl: SEARCH_URL,
+      ownedVacuum: OWNED_VACUUM,
+      searchQuery: SEARCH_QUERY,
+    });
+
+    logStep("Extracting bag title, price, and link with AI...");
+    const bagInfo = await extractBagInfoWithPolling(
+      () => callToolWithCookies("take_snapshot", {}),
+      { ownedVacuum: OWNED_VACUUM }
+    );
+
+    printBagInfo(bagInfo);
   } finally {
     await transport.close().catch(() => undefined);
   }
@@ -329,6 +195,15 @@ async function main() {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  console.error(`${chalk.redBright("Error:")} ${chalk.red(message)}`);
+
+  if (isOpenAiAuthError(error)) {
+    console.error(
+      `${chalk.redBright("OpenAI error:")} ${chalk.red(message)}\n` +
+        chalk.yellow("Check OPENAI_API_KEY and OPENAI_BASE_URL in agent-app/.env")
+    );
+  } else {
+    console.error(`${chalk.redBright("Error:")} ${chalk.red(message)}`);
+  }
+
   process.exitCode = 1;
 });
